@@ -14,9 +14,6 @@ extern "C" {
 // OS includes
 #include <cmsis_os.h>
 
-//default timeout waiting for phase measurement signals
-#define PH_CURRENT_MEAS_TIMEOUT 2 // [ms]
-
 // extern const float elec_rad_per_enc;
 extern uint32_t _reboot_cookie;
 
@@ -111,11 +108,6 @@ class ODriveCAN;
 
 extern ODriveCAN *odCAN;
 
-// if you use the oscilloscope feature you can bump up this value
-#define OSCILLOSCOPE_SIZE 4096
-extern float oscilloscope[OSCILLOSCOPE_SIZE];
-extern size_t oscilloscope_pos;
-
 // TODO: move
 // this is technically not thread-safe but practically it might be
 #define DEFINE_ENUM_FLAG_OPERATORS(ENUMTYPE) \
@@ -142,6 +134,7 @@ inline ENUMTYPE operator ~ (ENUMTYPE a) { return static_cast<ENUMTYPE>(~static_c
 #include <trapTraj.hpp>
 #include <endstop.hpp>
 #include <axis.hpp>
+#include <oscilloscope.hpp>
 #include <communication/communication.h>
 
 // Defined in autogen/version.c based on git-derived version numbers
@@ -163,10 +156,7 @@ public:
     void erase_configuration() override;
     void reboot() override { NVIC_SystemReset(); }
     void enter_dfu_mode() override;
-
-    float get_oscilloscope_val(uint32_t index) override {
-        return oscilloscope[index];
-    }
+    void clear_errors() override;
 
     float get_adc_voltage(uint32_t gpio) override {
         return ::get_adc_voltage(get_gpio(gpio));
@@ -177,12 +167,16 @@ public:
         return cnt += delta;
     }
 
+    void do_fast_checks();
+    void control_loop_cb(uint16_t update_cnt);
+
     Axis& get_axis(int num) { return axes[num]; }
     ODriveCAN& get_can() { return *odCAN; }
 
     uint32_t get_interrupt_status(int32_t irqn);
     uint32_t get_dma_status(uint8_t stream_num);
 
+    Error error_ = ERROR_NONE;
     float& vbus_voltage_ = ::vbus_voltage; // TODO: make this the actual variable
     float& ibus_ = ::ibus_; // TODO: make this the actual variable
     float ibus_report_filter_k_ = 1.0f;
@@ -221,12 +215,20 @@ public:
     bool& brake_resistor_saturated_ = ::brake_resistor_saturated; // TODO: make this the actual variable
 
     SystemStats_t system_stats_;
+    Oscilloscope oscilloscope_{
+        &axes[0].motor_.current_control_.v_current_control_integral_d_, // trigger_src
+        0.5f, // trigger_threshold
+        &axes[0].motor_.current_control_.Ialpha_measured_ // data_src
+    };
 
     BoardConfig_t config_;
     uint32_t user_config_loaded_ = 0;
     bool misconfigured_ = false;
 
     uint32_t test_property_ = 0;
+
+    uint32_t last_update_timestamp_ = 0;
+    uint16_t last_update_cnt_ = 0;
 };
 
 extern ODrive odrv; // defined in main.cpp

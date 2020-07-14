@@ -64,6 +64,9 @@
 
 #define TIM_TIME_BASE TIM14
 
+// Run control loop at the same frequency as the current measurements.
+#define CONTROL_TIMER_PERIOD_TICKS  (2 * TIM_1_8_PERIOD_CLOCKS * (TIM_1_8_RCR + 1))
+
 #ifdef __cplusplus
 #include <Drivers/DRV8301/drv8301.hpp>
 #include <Drivers/STM32/stm32_gpio.hpp>
@@ -121,5 +124,6 @@ static inline bool board_apply_config() { return true; }
 
 void system_init();
 bool board_init();
+void start_timers();
 
 #endif // __BOARD_CONFIG_H

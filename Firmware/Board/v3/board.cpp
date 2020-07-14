@@ -27,14 +27,14 @@ UART_HandleTypeDef* uart2 = nullptr;
 Drv8301 m0_gate_driver{
     &spi3_arbiter,
     {M0_nCS_GPIO_Port, M0_nCS_Pin}, // nCS
-    {EN_GATE_GPIO_Port, EN_GATE_Pin}, // EN pin (shared between both motors)
+    {}, // EN pin (shared between both motors, therefore we actuate it outside of the drv8301 driver)
     {nFAULT_GPIO_Port, nFAULT_Pin} // nFAULT pin (shared between both motors)
 };
 
 Drv8301 m1_gate_driver{
     &spi3_arbiter,
     {M1_nCS_GPIO_Port, M1_nCS_Pin}, // nCS
-    {EN_GATE_GPIO_Port, EN_GATE_Pin}, // EN pin (shared between both motors)
+    {}, // EN pin (shared between both motors, therefore we actuate it outside of the drv8301 driver)
     {nFAULT_GPIO_Port, nFAULT_Pin} // nFAULT pin (shared between both motors)
 };
 
@@ -61,14 +61,14 @@ OnboardThermistorCurrentLimiter fet_thermistors[AXIS_COUNT] = {
 Motor motors[AXIS_COUNT] = {
     {
         &htim1, // timer
-        TIM_1_8_PERIOD_CLOCKS, // control_deadline
+        0b110, // current_sensor_mask
         1.0f / SHUNT_RESISTANCE, // shunt_conductance [S]
         m0_gate_driver, // gate_driver
         m0_gate_driver // opamp
     },
     {
         &htim8, // timer
-        (3 * TIM_1_8_PERIOD_CLOCKS) / 2, // control_deadline
+        0b110, // current_sensor_mask
         1.0f / SHUNT_RESISTANCE, // shunt_conductance [S]
         m1_gate_driver, // gate_driver
         m1_gate_driver // opamp
@@ -253,6 +253,9 @@ PCD_HandleTypeDef& usb_pcd_handle = hpcd_USB_OTG_FS;
 extern USBD_HandleTypeDef hUsbDeviceFS;
 USBD_HandleTypeDef& usb_dev_handle = hUsbDeviceFS;
 
+TIM_HandleTypeDef htim9 = {0};
+TIM_HandleTypeDef htim11 = {0};
+
 void system_init() {
     // Reset of all peripherals, Initializes the Flash interface and the Systick.
     HAL_Init();
@@ -307,34 +310,123 @@ bool board_init() {
         }
     }
 
+
+    // TIM11 is used to trigger the main control loop
+    __HAL_RCC_TIM11_CLK_ENABLE();
+    htim11.Instance = TIM11;
+    htim11.Init.Period = CONTROL_TIMER_PERIOD_TICKS - 1; // TIM11 is on the same clock (PCLK2) as TIM1/8.
+    htim11.Init.Prescaler = 0;
+    htim11.Init.ClockDivision = 0;
+    htim11.Init.CounterMode = TIM_COUNTERMODE_UP;
+    if (HAL_TIM_Base_Init(&htim11) != HAL_OK) {
+        return false;
+    }
+
+    TIM_OC_InitTypeDef ocConfig = {0};
+    ocConfig.OCMode = TIM_OCMODE_PWM1;
+    ocConfig.Pulse = htim11.Init.Period; // generate an output compare event one clock cycle before the counter reaches the maximum
+    ocConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
+    if (HAL_TIM_OC_ConfigChannel(&htim11, &ocConfig, TIM_CHANNEL_1) != HAL_OK) {
+        return false;
+    }
+    htim11.Instance->CCER |= TIM_CCER_CC1E; // enable output (doesn't affect GPIOs unless they are configured to this timer)
+
+    HAL_NVIC_SetPriority(TIM1_TRG_COM_TIM11_IRQn, 2, 0); // one level below TIM1/TIM8 priority
+    HAL_NVIC_EnableIRQ(TIM1_TRG_COM_TIM11_IRQn);
+    __HAL_TIM_CLEAR_IT(&htim11, TIM_IT_UPDATE);
+    __HAL_TIM_ENABLE_IT(&htim11, TIM_IT_UPDATE);
+
+    // TIM9 is used to supervise TIM11 to ensure time is counted correctly
+    __HAL_RCC_TIM9_CLK_ENABLE();
+    htim9.Instance = TIM9;
+    htim9.Init.Period = 0xffff; // use full 16-bit range
+    htim9.Init.Prescaler = 0;
+    htim9.Init.ClockDivision = 0;
+    htim9.Init.CounterMode = TIM_COUNTERMODE_UP;
+    if (HAL_TIM_Base_Init(&htim9) != HAL_OK) {
+        return false;
+    }
+
+    TIM_ClockConfigTypeDef clockConfig;
+    clockConfig.ClockSource = TIM_CLOCKSOURCE_ITR3; // use TIM11 output compare event to increment timer
+    clockConfig.ClockPolarity = TIM_CLOCKPOLARITY_NONINVERTED;
+    clockConfig.ClockPrescaler = TIM_CLOCKPRESCALER_DIV1;
+    clockConfig.ClockFilter = 0x0;
+    if (HAL_TIM_ConfigClockSource(&htim9, &clockConfig) != HAL_OK) {
+        return false;
+    }
+    //__HAL_TIM_ENABLE_IT(&htim11, TIM_IT_CC1); // for debugging only
+    //__HAL_TIM_ENABLE_IT(&htim9, TIM_IT_TRIGGER); // for debugging only
+    __HAL_TIM_ENABLE(&htim9);
+
+
+
     // Ensure that debug halting of the core doesn't leave the motor PWM running
     __HAL_DBGMCU_FREEZE_TIM1();
     __HAL_DBGMCU_FREEZE_TIM8();
+    __HAL_DBGMCU_FREEZE_TIM11();
     __HAL_DBGMCU_FREEZE_TIM13();
 
-    /*
-    * Initial intention of the synchronization:
-    * Synchronize TIM1, TIM8 and TIM13 such that:
-    *  1. The triangle waveform of TIM1 leads the triangle waveform of TIM8 by a
-    *     90° phase shift.
-    *  2. The timer update events of TIM1 and TIM8 are symmetrically interleaved.
-    *  3. Each TIM13 reload coincides with a TIM1 lower update event.
-    * 
-    * However right now this synchronization only ensures point (1) and (3) but because
-    * TIM1 and TIM3 only trigger an update on every third reload, this does not
-    * allow for (2).
-    * 
-    * TODO: revisit the timing topic in general.
-    * 
-    */
-    Stm32Timer::start_synchronously<3>(
-        {&htim1, &htim8, &htim13},
-        {TIM_1_8_PERIOD_CLOCKS / 2 - 1 * 128 /* TODO: explain why this offset */, 0, TIM_1_8_PERIOD_CLOCKS / 2 - 1 * 128}
-    );
+    Stm32Gpio drv_enable_gpio = {EN_GATE_GPIO_Port, EN_GATE_Pin};
+
+    // Reset both DRV chips. The enable pin also controls the SPI interface, not
+    // only the driver stages.
+    drv_enable_gpio.write(false);
+    delay_us(40); // mimumum pull-down time for full reset: 20us
+    drv_enable_gpio.write(true);
+    delay_us(20000); // mimumum pull-down time for full reset: 20us
 
     return true;
 }
 
+void start_timers() {
+    CRITICAL_SECTION() {
+        hadc1.Instance->CR2 &= ~(ADC_CR2_JEXTEN);
+        hadc2.Instance->CR2 &= ~(ADC_CR2_EXTEN | ADC_CR2_JEXTEN);
+        hadc3.Instance->CR2 &= ~(ADC_CR2_EXTEN | ADC_CR2_JEXTEN);
+
+        /*
+        * Initial intention of the synchronization:
+        * Synchronize TIM1, TIM8 and TIM13 such that:
+        *  1. The triangle waveform of TIM1 leads the triangle waveform of TIM8 by a
+        *     90° phase shift.
+        *  2. The timer update events of TIM1 and TIM8 are symmetrically interleaved.
+        *  3. Each TIM13 reload coincides with a TIM1 lower update event.
+        * 
+        * However right now this synchronization only ensures point (1) and (3) but because
+        * TIM1 and TIM3 only trigger an update on every third reload, this does not
+        * allow for (2).
+        * 
+        * TODO: revisit the timing topic in general.
+        * 
+        */
+        Stm32Timer::start_synchronously<4>(
+            {&htim1, &htim8, &htim13, &htim11},
+            {TIM_1_8_PERIOD_CLOCKS / 2 - 1 * 128 /* TODO: explain why this offset */, 0, TIM_1_8_PERIOD_CLOCKS / 2 - 1 * 128, 0}
+        );
+
+        hadc1.Instance->CR2 |= (ADC_EXTERNALTRIGINJECCONVEDGE_RISING);
+        hadc2.Instance->CR2 |= (ADC_EXTERNALTRIGCONVEDGE_RISING | ADC_EXTERNALTRIGINJECCONVEDGE_RISING);
+        hadc3.Instance->CR2 |= (ADC_EXTERNALTRIGCONVEDGE_RISING | ADC_EXTERNALTRIGINJECCONVEDGE_RISING);
+
+        __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_JEOC);
+        __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_JEOC);
+        __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_JEOC);
+        __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_EOC);
+        __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_EOC);
+        __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_EOC);
+        __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
+        __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_OVR);
+        __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_OVR);
+
+        // it's sufficient to enable interrupts for one ADC only because they all trigger simultaneously
+        __HAL_ADC_ENABLE_IT(&hadc3, ADC_IT_JEOC);
+        __HAL_ADC_ENABLE_IT(&hadc3, ADC_IT_EOC);
+        
+        __HAL_TIM_CLEAR_IT(&htim11, TIM_IT_UPDATE);
+        __HAL_TIM_ENABLE_IT(&htim11, TIM_IT_UPDATE);
+    }
+}
 
 extern "C" {
 
@@ -354,49 +446,58 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
 
 
 
-void TIM1_UP_TIM10_IRQHandler(void) {
-    COUNT_IRQ(TIM1_UP_TIM10_IRQn);
-    __HAL_TIM_CLEAR_IT(&htim1, TIM_IT_UPDATE);
-    motors[0].tim_update_cb();
-}
-
-void TIM8_UP_TIM13_IRQHandler(void) {
-    COUNT_IRQ(TIM8_UP_TIM13_IRQn);
-    __HAL_TIM_CLEAR_IT(&htim8, TIM_IT_UPDATE);
-    motors[1].tim_update_cb();
-}
-
 void TIM5_IRQHandler(void) {
     COUNT_IRQ(TIM5_IRQn);
     pwm0_input.on_capture();
 }
 
-void ADC_IRQ_Dispatch(ADC_HandleTypeDef* hadc, void(*callback)(ADC_HandleTypeDef* hadc, bool injected)) {
-    // Injected measurements
-    uint32_t JEOC = __HAL_ADC_GET_FLAG(hadc, ADC_FLAG_JEOC);
-    uint32_t JEOC_IT_EN = __HAL_ADC_GET_IT_SOURCE(hadc, ADC_IT_JEOC);
-    if (JEOC && JEOC_IT_EN) {
-        callback(hadc, true);
-        __HAL_ADC_CLEAR_FLAG(hadc, (ADC_FLAG_JSTRT | ADC_FLAG_JEOC));
-    }
-    // Regular measurements
-    uint32_t EOC = __HAL_ADC_GET_FLAG(hadc, ADC_FLAG_EOC);
-    uint32_t EOC_IT_EN = __HAL_ADC_GET_IT_SOURCE(hadc, ADC_IT_EOC);
-    if (EOC && EOC_IT_EN) {
-        callback(hadc, false);
-        __HAL_ADC_CLEAR_FLAG(hadc, (ADC_FLAG_STRT | ADC_FLAG_EOC));
+void TIM1_TRG_COM_TIM11_IRQHandler(void) {
+    COUNT_IRQ(TIM1_TRG_COM_TIM11_IRQn);
+    if (__HAL_TIM_GET_FLAG(&htim11, TIM_FLAG_UPDATE) != RESET) {
+        __HAL_TIM_CLEAR_IT(&htim11, TIM_IT_UPDATE);
+        odrv.control_loop_cb(htim9.Instance->CNT);
     }
 }
 
 void ADC_IRQHandler(void) {
     COUNT_IRQ(ADC_IRQn);
     
-    // The HAL's ADC handling mechanism adds many clock cycles of overhead
-    // So we bypass it and handle the logic ourselves.
-    //@TODO add vbus measurement on adc1 here
-    ADC_IRQ_Dispatch(&hadc1, &vbus_sense_adc_cb);
-    ADC_IRQ_Dispatch(&hadc2, &pwm_trig_adc_cb);
-    ADC_IRQ_Dispatch(&hadc3, &pwm_trig_adc_cb);
+    // Injected measurements on ADC1 are used for vbus_voltage measurements
+    if (__HAL_ADC_GET_FLAG(&hadc1, ADC_FLAG_JEOC)) {
+        __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_JEOC);
+        vbus_sense_adc_cb(ADC1->JDR1);
+    }
+
+    // Injected measurements on ADC2 and ADC3 are used for M0 phase current measurements
+    if (__HAL_ADC_GET_FLAG(&hadc2, ADC_FLAG_JEOC) || __HAL_ADC_GET_FLAG(&hadc3, ADC_FLAG_JEOC)) {
+        __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE); // used to detect if timing constraints are met
+        motors[0].tim_update_cb(
+            0xffffffff, // no current sensor on phase A
+            __HAL_ADC_GET_FLAG(&hadc2, ADC_FLAG_JEOC) ? ADC2->JDR1 : 0xffffffff,
+            __HAL_ADC_GET_FLAG(&hadc3, ADC_FLAG_JEOC) ? ADC3->JDR1 : 0xffffffff
+        );
+        __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_JEOC);
+        __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_JEOC);
+    }
+
+    // Regular measurements on ADC2 and ADC3 are used for M1 phase current measurements
+    if (__HAL_ADC_GET_FLAG(&hadc2, ADC_FLAG_EOC) || __HAL_ADC_GET_FLAG(&hadc3, ADC_FLAG_EOC)) {
+        __HAL_TIM_CLEAR_FLAG(&htim8, TIM_FLAG_UPDATE); // used to detect if timing constraints are met
+        uint32_t adc_readings[3] = {
+            0xffffffff, // no current sensor on phase A
+            __HAL_ADC_GET_FLAG(&hadc2, ADC_FLAG_EOC) ? ADC2->DR : 0xffffffff,
+            __HAL_ADC_GET_FLAG(&hadc3, ADC_FLAG_EOC) ? ADC3->DR : 0xffffffff
+        };
+        motors[1].tim_update_cb(
+            adc_readings[0],
+            __HAL_ADC_GET_FLAG(&hadc2, ADC_FLAG_OVR) ? 0xffffffff : adc_readings[1],
+            __HAL_ADC_GET_FLAG(&hadc3, ADC_FLAG_OVR) ? 0xffffffff : adc_readings[2]
+        );
+        __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_OVR);
+        __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_OVR);
+        __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_EOC);
+        __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_EOC);
+    }
 }
 
 void I2C1_EV_IRQHandler(void) {

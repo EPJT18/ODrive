@@ -75,72 +75,12 @@ bool brake_resistor_saturated = false;
 // @brief Floats ALL phases immediately and disarms both motors and the brake resistor.
 void low_level_fault(Motor::Error error) {
     // Disable all motors NOW!
-    for (size_t i = 0; i < AXIS_COUNT; ++i) {
-        safety_critical_disarm_motor_pwm(axes[i].motor_);
-        axes[i].motor_.error_ |= error;
+    for (auto& axis: axes) {
+        axis.motor_.disarm();
+        axis.motor_.error_ |= error;
     }
 
     safety_critical_disarm_brake_resistor();
-}
-
-// @brief Kicks off the arming process of the motor.
-// All calls to this function must clearly originate
-// from user input.
-void safety_critical_arm_motor_pwm(Motor& motor) {
-    uint32_t mask = cpu_enter_critical();
-    if (brake_resistor_armed) {
-        motor.armed_state_ = Motor::ARMED_STATE_WAITING_FOR_TIMINGS;
-    }
-    cpu_exit_critical(mask);
-}
-
-// @brief Disarms the motor PWM.
-// After calling this function, it is guaranteed that all three
-// motor phases are floating and will not be enabled again until
-// safety_critical_arm_motor_phases is called.
-// @returns true if the motor was in a state other than disarmed before
-bool safety_critical_disarm_motor_pwm(Motor& motor) {
-    uint32_t mask = cpu_enter_critical();
-    bool was_armed = motor.armed_state_ != Motor::ARMED_STATE_DISARMED;
-    motor.armed_state_ = Motor::ARMED_STATE_DISARMED;
-    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(motor.timer_);
-    cpu_exit_critical(mask);
-    return was_armed;
-}
-
-// @brief Updates the phase timings unless the motor is disarmed.
-//
-// If this is called at a rate higher than the motor's timer period,
-// the actual PMW timings on the pins can be undefined for up to one
-// timer period.
-void safety_critical_apply_motor_pwm_timings(Motor& motor, uint16_t timings[3]) {
-    uint32_t mask = cpu_enter_critical();
-    if (!brake_resistor_armed) {
-        motor.armed_state_ = Motor::ARMED_STATE_DISARMED;
-    }
-
-    motor.timer_->Instance->CCR1 = timings[0];
-    motor.timer_->Instance->CCR2 = timings[1];
-    motor.timer_->Instance->CCR3 = timings[2];
-
-    if (motor.armed_state_ == Motor::ARMED_STATE_WAITING_FOR_TIMINGS) {
-        // timings were just loaded into the timer registers
-        // the timer register are buffered, so they won't have an effect
-        // on the output just yet so we need to wait until the next
-        // interrupt before we actually enable the output
-        motor.armed_state_ = Motor::ARMED_STATE_WAITING_FOR_UPDATE;
-    } else if (motor.armed_state_ == Motor::ARMED_STATE_WAITING_FOR_UPDATE) {
-        // now we waited long enough. Enter armed state and
-        // enable the actual PWM outputs.
-        motor.armed_state_ = Motor::ARMED_STATE_ARMED;
-        __HAL_TIM_MOE_ENABLE(motor.timer_);  // enable pwm outputs
-    } else if (motor.armed_state_ == Motor::ARMED_STATE_ARMED) {
-        // nothing to do, PWM is running, all good
-    } else {
-        // unknown state oh no
-        safety_critical_disarm_motor_pwm(motor);
-    }
-    cpu_exit_critical(mask);
 }
 
 // @brief Arms the brake resistor
@@ -161,8 +101,8 @@ void safety_critical_disarm_brake_resistor() {
     brake_resistor_armed = false;
     htim2.Instance->CCR3 = 0;
     htim2.Instance->CCR4 = TIM_APB1_PERIOD_CLOCKS + 1;
-    for (size_t i = 0; i < AXIS_COUNT; ++i) {
-        safety_critical_disarm_motor_pwm(axes[i].motor_);
+    for (auto& axis: axes) {
+        axis.motor_.disarm();
     }
     cpu_exit_critical(mask);
 }
@@ -189,8 +129,8 @@ void safety_critical_apply_brake_resistor_timings(uint32_t low_off, uint32_t hig
 
 void start_adc_pwm() {
     // Disarm motors
-    for (size_t i = 0; i < AXIS_COUNT; ++i) {
-        safety_critical_disarm_motor_pwm(axes[i].motor_);
+    for (auto& axis: axes) {
+        axis.motor_.disarm();
     }
 
     for (Motor& motor: motors) {
@@ -215,26 +155,9 @@ void start_adc_pwm() {
     __HAL_ADC_ENABLE(&hadc3);
     // Warp field stabilize.
     osDelay(2);
-    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_JEOC);
-    __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_JEOC);
-    __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_JEOC);
-    __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_EOC);
-    __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_EOC);
-    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
-    __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_OVR);
-    __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_OVR);
-    __HAL_ADC_ENABLE_IT(&hadc1, ADC_IT_JEOC);
-    __HAL_ADC_ENABLE_IT(&hadc2, ADC_IT_JEOC);
-    __HAL_ADC_ENABLE_IT(&hadc3, ADC_IT_JEOC);
-    __HAL_ADC_ENABLE_IT(&hadc2, ADC_IT_EOC);
-    __HAL_ADC_ENABLE_IT(&hadc3, ADC_IT_EOC);
 
 
-    for (Motor& motor: motors) {
-        // Enable the update interrupt (used to coherently sample GPIO)
-        __HAL_TIM_CLEAR_IT(motor.timer_, TIM_IT_UPDATE);
-        __HAL_TIM_ENABLE_IT(motor.timer_, TIM_IT_UPDATE);
-    }
+    start_timers();
 
 
     // Start brake resistor PWM in floating output configuration
@@ -372,111 +295,9 @@ float get_adc_voltage_channel(uint16_t channel)
 // IRQ Callbacks
 //--------------------------------
 
-void vbus_sense_adc_cb(ADC_HandleTypeDef* hadc, bool injected) {
+void vbus_sense_adc_cb(uint32_t adc_value) {
     static const float voltage_scale = adc_ref_voltage * VBUS_S_DIVIDER_RATIO / adc_full_scale;
-    // Only one conversion in sequence, so only rank1
-    uint32_t ADCValue = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
-    vbus_voltage = ADCValue * voltage_scale;
-}
-
-// This is the callback from the ADC that we expect after the PWM has triggered an ADC conversion.
-// TODO: Document how the phasing is done, link to timing diagram
-void pwm_trig_adc_cb(ADC_HandleTypeDef* hadc, bool injected) {
-#define calib_tau 0.2f  //@TOTO make more easily configurable
-    static const float calib_filter_k = CURRENT_MEAS_PERIOD / calib_tau;
-
-    // Ensure ADCs are expected ones to simplify the logic below
-    if (!(hadc == &hadc2 || hadc == &hadc3)) {
-        low_level_fault(Motor::ERROR_ADC_FAILED);
-        return;
-    };
-
-    // Motor 0 is on Timer 1, which triggers ADC 2 and 3 on an injected conversion
-    // Motor 1 is on Timer 8, which triggers ADC 2 and 3 on a regular conversion
-    // If the corresponding timer is counting up, we just sampled in SVM vector 0, i.e. real current
-    // If we are counting down, we just sampled in SVM vector 7, with zero current
-    Axis& axis = injected ? axes[0] : axes[1];
-    int axis_num = injected ? 0 : 1;
-    Axis& other_axis = injected ? axes[1] : axes[0];
-    bool counting_down = axis.motor_.timer_->Instance->CR1 & TIM_CR1_DIR;
-    bool current_meas_not_DC_CAL = !counting_down;
-
-    // Check the timing of the sequencing
-    if (current_meas_not_DC_CAL)
-        axis.motor_.log_timing(TIMING_LOG_ADC_CB_I);
-    else
-        axis.motor_.log_timing(TIMING_LOG_ADC_CB_DC);
-
-    bool update_timings = false;
-    if (hadc == &hadc2) {
-        if (&axis == &axes[1] && counting_down)
-            update_timings = true; // update timings of M0
-        else if (&axis == &axes[0] && !counting_down)
-            update_timings = true; // update timings of M1
-
-        // TODO: this is out of place here. However when moving it somewhere
-        // else we have to consider the timing requirements to prevent the SPI
-        // transfers of axis0 and axis1 from conflicting.
-        // Also see comment on sync_timers.
-        if((current_meas_not_DC_CAL && !axis_num) ||
-                (axis_num && !current_meas_not_DC_CAL)){
-            axis.encoder_.abs_spi_start_transaction();
-        }
-    }
-
-    // Load next timings for the motor that we're not currently sampling
-    if (update_timings) {
-        if (!other_axis.motor_.next_timings_valid_) {
-            // the motor control loop failed to update the timings in time
-            // we must assume that it died and therefore float all phases
-            bool was_armed = safety_critical_disarm_motor_pwm(other_axis.motor_);
-            if (was_armed) {
-                other_axis.motor_.error_ |= Motor::ERROR_CONTROL_DEADLINE_MISSED;
-            }
-        } else {
-            other_axis.motor_.next_timings_valid_ = false;
-            safety_critical_apply_motor_pwm_timings(
-                other_axis.motor_, other_axis.motor_.next_timings_
-            );
-        }
-        update_brake_current();
-    }
-
-    uint32_t ADCValue;
-    if (injected) {
-        ADCValue = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
-    } else {
-        ADCValue = HAL_ADC_GetValue(hadc);
-    }
-    float current = axis.motor_.phase_current_from_adcval(ADCValue);
-
-    if (current_meas_not_DC_CAL) {
-        // ADC2 and ADC3 record the phB and phC currents concurrently,
-        // and their interrupts should arrive on the same clock cycle.
-        // We dispatch the callbacks in order, so ADC2 will always be processed before ADC3.
-        // Therefore we store the value from ADC2 and signal the thread that the
-        // measurement is ready when we receive the ADC3 measurement
-
-        // return or continue
-        if (hadc == &hadc2) {
-            axis.motor_.current_meas_.phB = current - axis.motor_.DC_calib_.phB;
-            return;
-        } else {
-            axis.motor_.current_meas_.phC = current - axis.motor_.DC_calib_.phC;
-        }
-        // Prepare hall readings
-        // TODO move this to inside encoder update function
-        axis.encoder_.decode_hall_samples();
-        // Trigger axis thread
-        axis.signal_current_meas();
-    } else {
-        // DC_CAL measurement
-        if (hadc == &hadc2) {
-            axis.motor_.DC_calib_.phB += (current - axis.motor_.DC_calib_.phB) * calib_filter_k;
-        } else {
-            axis.motor_.DC_calib_.phC += (current - axis.motor_.DC_calib_.phC) * calib_filter_k;
-        }
-    }
+    vbus_voltage = adc_value * voltage_scale;
 }
 
 // @brief Sums up the Ibus contribution of each motor and updates the
@@ -484,8 +305,8 @@ void pwm_trig_adc_cb(ADC_HandleTypeDef* hadc, bool injected) {
 void update_brake_current() {
     float Ibus_sum = 0.0f;
     for (size_t i = 0; i < AXIS_COUNT; ++i) {
-        if (axes[i].motor_.armed_state_ == Motor::ARMED_STATE_ARMED) {
-            Ibus_sum += axes[i].motor_.current_control_.Ibus;
+        if (axes[i].motor_.is_armed_) {
+            Ibus_sum += axes[i].motor_.I_bus_;
         }
     }
     

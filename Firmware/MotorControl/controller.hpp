@@ -37,7 +37,13 @@ public:
         bool enable_current_mode_vel_limit = true;           // enable velocity limit in current control mode (requires a valid velocity estimator)
         uint8_t axis_to_mirror = -1;
         float mirror_ratio = 1.0f;
-        uint8_t load_encoder_axis = -1;                 // default depends on Axis number and is set in load_configuration()
+        uint8_t load_encoder_axis = -1;                 // default depends on Axis number and is set in load_configuration(). Set to -1 to select sensorless estimator.
+
+        float acim_gain_min_flux = 10; // [A]
+        float acim_autoflux_min_Id = 10; // [A]
+        bool acim_autoflux_enable = false;
+        float acim_autoflux_attack_gain = 10.0f;
+        float acim_autoflux_decay_gain = 1.0f;
 
         // custom setters
         Controller* parent;
@@ -63,17 +69,16 @@ public:
     bool anticogging_calibration(float pos_estimate, float vel_estimate);
 
     void update_filter_gains();
-    bool update(float* torque_setpoint);
+    bool update();
 
     Config_t config_;
     Axis* axis_ = nullptr; // set by Axis constructor
 
     Error error_ = ERROR_NONE;
 
+    // Inputs
     float* pos_estimate_src_ = nullptr;
-    bool* pos_estimate_valid_src_ = nullptr;
     float* vel_estimate_src_ = nullptr;
-    bool* vel_estimate_valid_src_ = nullptr;
     int32_t* pos_wrap_src_ = nullptr; // enables circular position setpoints if not null. The value pointed to is the maximum position value.
 
     float pos_setpoint_ = 0.0f;
@@ -93,6 +98,10 @@ public:
     bool trajectory_done_ = true;
 
     bool anticogging_valid_ = false;
+
+    // Outputs
+    float Id_setpoint_ = 0.0f; // this is currently also an input (TODO: change)
+    float Iq_setpoint_ = NAN;
 
     // custom setters
     void set_input_pos(float value) { input_pos_ = value; input_pos_updated(); }
