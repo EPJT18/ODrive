@@ -17,9 +17,6 @@ osSemaphoreId sem_usb_rx;
 osSemaphoreId sem_usb_tx;
 osSemaphoreId sem_can;
 
-osThreadId usb_irq_thread;
-const uint32_t stack_size_usb_irq_thread = 2048; // Bytes
-
 #if defined(STM32F405xx)
 // Place FreeRTOS heap in core coupled memory for better performance
 __attribute__((section(".ccmram")))
@@ -163,21 +160,6 @@ void ODrive::clear_errors() {
     error_ = ERROR_NONE;
 }
 
-static void usb_deferred_interrupt_thread(void * ctx) {
-    (void) ctx; // unused parameter
-
-    for (;;) {
-        // Wait for signalling from USB interrupt (OTG_FS_IRQHandler)
-        osStatus semaphore_status = osSemaphoreWait(sem_usb_irq, osWaitForever);
-        if (semaphore_status == osOK) {
-            // We have a new incoming USB transmission: handle it
-            HAL_PCD_IRQHandler(&usb_pcd_handle);
-            // Let the irq (OTG_FS_IRQHandler) fire again.
-            HAL_NVIC_EnableIRQ((usb_pcd_handle.Instance == USB_OTG_FS) ? OTG_FS_IRQn : OTG_HS_IRQn);
-        }
-    }
-}
-
 extern "C" {
 
 void vApplicationStackOverflowHook(xTaskHandle *pxTask, signed portCHAR *pcTaskName) {
@@ -197,7 +179,6 @@ void vApplicationIdleHook(void) {
         odrv.system_stats_.min_stack_space_axis = *std::min_element(std::begin(min_stack_space), std::end(min_stack_space));
         odrv.system_stats_.min_stack_space_usb = uxTaskGetStackHighWaterMark(usb_thread) * sizeof(StackType_t);
         odrv.system_stats_.min_stack_space_uart = uxTaskGetStackHighWaterMark(uart_thread) * sizeof(StackType_t);
-        odrv.system_stats_.min_stack_space_usb_irq = uxTaskGetStackHighWaterMark(usb_irq_thread) * sizeof(StackType_t);
         odrv.system_stats_.min_stack_space_startup = uxTaskGetStackHighWaterMark(defaultTaskHandle) * sizeof(StackType_t);
         odrv.system_stats_.min_stack_space_can = uxTaskGetStackHighWaterMark(odCAN->thread_id_) * sizeof(StackType_t);
 
@@ -205,7 +186,6 @@ void vApplicationIdleHook(void) {
         odrv.system_stats_.stack_usage_axis = axes[0].stack_size_ - odrv.system_stats_.min_stack_space_axis;
         odrv.system_stats_.stack_usage_usb = stack_size_usb_thread - odrv.system_stats_.min_stack_space_usb;
         odrv.system_stats_.stack_usage_uart = stack_size_uart_thread - odrv.system_stats_.min_stack_space_uart;
-        odrv.system_stats_.stack_usage_usb_irq = stack_size_usb_irq_thread - odrv.system_stats_.min_stack_space_usb_irq;
         odrv.system_stats_.stack_usage_startup = stack_size_default_task - odrv.system_stats_.min_stack_space_startup;
         odrv.system_stats_.stack_usage_can = odCAN->stack_size_ - odrv.system_stats_.min_stack_space_can;
     }
@@ -622,11 +602,6 @@ extern "C" int main(void) {
     osSemaphoreDef(sem_can);
     sem_can = osSemaphoreCreate(osSemaphore(sem_can), 1);
     osSemaphoreWait(sem_can, 0);
-
-    // Start USB interrupt handler thread
-    osThreadDef(task_usb_pump, usb_deferred_interrupt_thread, osPriorityAboveNormal, 0, stack_size_usb_irq_thread / sizeof(StackType_t));
-    usb_irq_thread = osThreadCreate(osThread(task_usb_pump), NULL);
-
 
     // Construct all objects.
     odCAN = new ODriveCAN(can_config, &hcan1);

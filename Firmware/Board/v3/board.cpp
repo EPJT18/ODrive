@@ -248,8 +248,6 @@ PwmInput pwm0_input{&htim5, {0, 0, 0, 4}}; // 0 means not in use
 PwmInput pwm0_input{&htim5, {1, 2, 3, 4}};
 #endif
 
-extern PCD_HandleTypeDef hpcd_USB_OTG_FS; // defined in usbd_conf.c
-PCD_HandleTypeDef& usb_pcd_handle = hpcd_USB_OTG_FS;
 extern USBD_HandleTypeDef hUsbDeviceFS;
 USBD_HandleTypeDef& usb_dev_handle = hUsbDeviceFS;
 
@@ -510,12 +508,10 @@ void I2C1_ER_IRQHandler(void) {
     HAL_I2C_ER_IRQHandler(&hi2c1);
 }
 
+extern PCD_HandleTypeDef hpcd_USB_OTG_FS; // defined in usbd_conf.c
 void OTG_FS_IRQHandler(void) {
     COUNT_IRQ(OTG_FS_IRQn);
-    // Mask interrupt, and signal processing of interrupt by usb_cmd_thread
-    // The thread will re-enable the interrupt when all pending irqs are clear.
-    HAL_NVIC_DisableIRQ(OTG_FS_IRQn);
-    osSemaphoreRelease(sem_usb_irq);
+    HAL_PCD_IRQHandler(&hpcd_USB_OTG_FS);
 }
 
 }

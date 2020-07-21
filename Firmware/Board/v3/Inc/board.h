@@ -87,7 +87,6 @@ extern Encoder encoders[AXIS_COUNT];
 extern Stm32Gpio gpios[GPIO_COUNT];
 extern uint8_t alternate_functions[GPIO_COUNT][10];
 
-extern PCD_HandleTypeDef& usb_pcd_handle;
 extern USBD_HandleTypeDef& usb_dev_handle;
 
 extern Stm32SpiArbiter& ext_spi_arbiter;

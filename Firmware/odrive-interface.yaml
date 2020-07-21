@@ -104,12 +104,10 @@ interfaces:
           min_stack_space_usb: readonly uint32
           min_stack_space_uart: readonly uint32
           min_stack_space_can: readonly uint32
-          min_stack_space_usb_irq: readonly uint32
           min_stack_space_startup: readonly uint32
           stack_usage_axis: readonly uint32
           stack_usage_usb: readonly uint32
           stack_usage_uart: readonly uint32
-          stack_usage_usb_irq: readonly uint32
           stack_usage_startup: readonly uint32
           stack_usage_can: readonly uint32
           usb:

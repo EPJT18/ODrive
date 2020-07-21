@@ -30,14 +30,12 @@ typedef struct {
     uint32_t min_stack_space_axis; // minimum remaining space since startup [Bytes]
     uint32_t min_stack_space_usb;
     uint32_t min_stack_space_uart;
-    uint32_t min_stack_space_usb_irq;
     uint32_t min_stack_space_startup;
     uint32_t min_stack_space_can;
 
     uint32_t stack_usage_axis;
     uint32_t stack_usage_usb;
     uint32_t stack_usage_uart;
-    uint32_t stack_usage_usb_irq;
     uint32_t stack_usage_startup;
     uint32_t stack_usage_can;
 
